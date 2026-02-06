@@ -6,15 +6,7 @@ import sys
 import platform
 import traceback
 from pathlib import Path
-import re
-import markdown
-from pygments import highlight
-from pygments.lexers import get_lexer_by_name
-from pygments.formatters import HtmlFormatter
-
-# Global variables for model and tokenizer
-model = None
-tokenizer = None
+import inspect
 
 # Get system info for display
 def get_system_info():
@@ -39,7 +31,6 @@ def log(message, level="INFO"):
 
 # Configure and load model
 def load_model():
-    global model, tokenizer
     log("Loading model...")
     
     # Get model name from environment variable or find it in models directory
@@ -55,10 +46,10 @@ def load_model():
                 log(f"Found model directory: {model_name}")
             else:
                 log("No model directories found in ./models", "ERROR")
-                return False
+                return None, None
         else:
             log("Models directory not found", "ERROR")
-            return False
+            return None, None
     
     model_path = f"./models/{model_name}"
     log(f"Using model: {model_name} at {model_path}")
@@ -72,13 +63,13 @@ def load_model():
         if torch.cuda.is_available():
             log("Loading model with GPU acceleration...")
             
-            # Try to load with 4-bit quantization first (more memory efficient for 8GB GPUs)
+            # For 32GB RAM system, we can use 8-bit quantization for better quality
+            # while still allowing for larger models
             try:
+                # First try 8-bit quantization (better quality than 4-bit)
                 quantization_config = BitsAndBytesConfig(
-                    load_in_4bit=True,
-                    bnb_4bit_compute_dtype=torch.float16,
-                    bnb_4bit_use_double_quant=True,
-                    bnb_4bit_quant_type="nf4"
+                    load_in_8bit=True,
+                    llm_int8_has_fp16_weight=True
                 )
                 
                 model = AutoModelForCausalLM.from_pretrained(
@@ -87,20 +78,22 @@ def load_model():
                     device_map="auto",
                     trust_remote_code=True,
                     low_cpu_mem_usage=True,
-                    max_memory={0: "7GiB", "cpu": "16GiB"}  # Optimize for 8GB GPU
+                    max_memory={0: "24GiB", "cpu": "8GiB"}  # Optimize for 32GB system
                 )
-                log("Model loaded with 4-bit quantization (optimized for 8GB GPU)")
+                log("Model loaded with 8-bit quantization (optimized for 32GB RAM)")
             except Exception as e:
-                log(f"4-bit quantization failed: {str(e)}", "WARNING")
-                log("Falling back to CPU-only mode (will be slower)...")
+                log(f"8-bit quantization failed: {str(e)}", "WARNING")
+                log("Falling back to 16-bit precision...")
                 
                 model = AutoModelForCausalLM.from_pretrained(
                     model_path,
-                    device_map="cpu",  # Force CPU-only as fallback
+                    torch_dtype=torch.float16,
+                    device_map="auto",
                     trust_remote_code=True,
-                    low_cpu_mem_usage=True
+                    low_cpu_mem_usage=True,
+                    max_memory={0: "24GiB", "cpu": "8GiB"}  # Optimize for 32GB system
                 )
-                log("Model loaded on CPU only (slower but more compatible)")
+                log("Model loaded with 16-bit precision (optimized for 32GB RAM)")
         else:
             log("Loading model on CPU (will be slow)...")
             model = AutoModelForCausalLM.from_pretrained(
@@ -111,12 +104,12 @@ def load_model():
             )
             log("Model loaded on CPU")
         
-        return True
+        return model, tokenizer
     
     except Exception as e:
         log(f"Error loading model: {str(e)}", "ERROR")
         log(traceback.format_exc(), "ERROR")
-        return False
+        return None, None
 
 # Get the maximum supported length for the model
 def get_max_length(tokenizer):
@@ -151,15 +144,10 @@ def process_files(files):
     
     return file_context
 
-# Simple chatbot function with improved code formatting
-def chat(message, history, files):
-    global model, tokenizer
-    
-    if not message.strip():
-        return history
-    
+# Function to process user queries
+def process_query(message, history, files, model, tokenizer):
     if model is None or tokenizer is None:
-        return history + [(message, "Error: Model not loaded. Please check console for errors.")]
+        return "Error: Model failed to load. Please check the logs and restart the application."
     
     # Process file content if files are uploaded
     file_context = process_files(files) if files else ""
@@ -183,9 +171,9 @@ def chat(message, history, files):
                 top_p=0.9,
                 top_k=40,
                 do_sample=True,
-                num_beams=1,
+                num_beams=1,  # Disable beam search for faster generation
                 pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.1
+                repetition_penalty=1.1  # Slightly penalize repetition
             )
         
         response = tokenizer.decode(output[0], skip_special_tokens=True)
@@ -198,102 +186,83 @@ def chat(message, history, files):
         if not response or response.isspace():
             response = "I couldn't generate a meaningful response. Please try rephrasing your question."
         
-        # Specifically detect C++ code
-        if "C++" in message or "c++" in message or "cpp" in message:
-            # Check if response contains code-like content
-            if re.search(r'#include|namespace|void\s+\w+|int\s+main', response):
-                # If there are no existing code blocks, wrap entire response in a C++ code block
-                if "```" not in response:
-                    response = f"```cpp\n{response}\n```"
-                # Otherwise, ensure code blocks are marked as C++
-                else:
-                    response = re.sub(r'```(\s*)', r'```cpp\n', response)
-        
-        # Use HTML for code highlighting to ensure proper display
-        html_response = markdown.markdown(response, extensions=['fenced_code', 'codehilite'])
-        
-        return history + [(message, html_response)]
-        
+        return response
+    
     except Exception as e:
-        print(f"Error generating response: {str(e)}")
-        return history + [(message, f"An error occurred: {str(e)}")]
-
-# Function to clear chat history and textbox
-def clear_chat_and_textbox():
-    return None, ""
+        return f"An error occurred while generating a response: {str(e)}"
 
 # Main function
 def main():
-    # Load the model and tokenizer
-    if not load_model():
+    # Load model and tokenizer
+    model, tokenizer = load_model()
+    
+    if model is None or tokenizer is None:
         print("Failed to load model. Exiting.")
         sys.exit(1)
+    
+    # Create a simple cache mechanism for large texts
+    input_cache = {}
+    response_cache = {}
     
     # Get system info
     system_info = get_system_info()
     info_text = "\n".join([f"**{k}**: {v}" for k, v in system_info.items()])
     
-    # Create Gradio interface with improved styling and external CSS
-    with gr.Blocks(theme=gr.themes.Soft(), css="style.css") as demo:
-        # Header with improved styling
+    # Create Gradio interface
+    with gr.Blocks(theme=gr.themes.Soft()) as demo:
         gr.Markdown(f"# DeepSeek Local Interface - {os.environ.get('MODEL_NAME', 'Unknown Model')}")
+        gr.Markdown("All processing occurs locally on your machine. Uploaded files are never sent over the internet.")
         
-        # Privacy notice with improved styling
-        gr.Markdown(
-            "**PRIVACY NOTICE**: All processing occurs locally on your machine. Uploaded files and queries never leave your computer.",
-            elem_classes="privacy-notice"
-        )
-        
-        # System information in a collapsible section with improved styling
         with gr.Accordion("System Information", open=False):
-            gr.Markdown(info_text, elem_classes="system-info")
-            gr.Markdown(f"**Model**: {os.environ.get('MODEL_NAME', 'Unknown')}")
+            gr.Markdown(info_text)
+            gr.Markdown(f"**Model**: {os
+.environ.get('MODEL_NAME', 'Unknown')}")
+            gr.Markdown("**Privacy Notice**: All processing occurs locally. Files and queries never leave your machine.")
         
-        # File upload area with improved styling
-        files = gr.File(
-            file_count="multiple", 
-            label="Upload Files (Processed Locally)"
-        )
-        
-        # Chat interface with improved styling
-        chatbot = gr.Chatbot(
-            label="Chat",
-            height=500,
-            elem_classes="chatbot-custom",
-            render=True,
-            sanitize_html=False
-        )
-        
-        # Input area with improved styling
         with gr.Row():
-            with gr.Column(scale=6):
-                msg = gr.Textbox(
-                    label="Enter your query",
-                    placeholder="Type your question here and press Enter to submit",
-                    lines=3,
-                    show_label=True,
-                )
             with gr.Column(scale=1):
-                submit_btn = gr.Button("Submit")
-                clear_btn = gr.Button("Clear")
+                files = gr.File(file_count="multiple", label="Upload Files (Processed Locally)")
+                gr.Markdown("Files are processed entirely on your local machine.")
+            
+        chatbot = gr.Chatbot(height=500)
+        msg = gr.Textbox(label="Enter your query", placeholder="Type your question here...", lines=3)
+        clear = gr.Button("Clear Chat")
         
-        # Help text
-        gr.Markdown("**TIP**: Press Enter to submit. For code questions, specify the programming language.")
+        # Handle query submission
+        msg.submit(
+            fn=lambda message, history, files: process_query(message, history, files, model, tokenizer),
+            inputs=[msg, chatbot, files],
+            outputs=chatbot
+        )
         
-        # Hook up the chat function to ensure Enter key works
-        msg.submit(chat, [msg, chatbot, files], [chatbot])
-        submit_btn.click(chat, [msg, chatbot, files], [chatbot])
-        
-        # Add clear button functionality that also clears the textbox
-        clear_btn.click(clear_chat_and_textbox, None, [chatbot, msg])
+        # Clear chat history
+        clear.click(lambda: None, None, chatbot, queue=False)
     
     # Get port from environment variable or use default
-    port = int(os.environ.get('DEEPSEEK_PORT', 7860))
+    port = int(os.environ.get("DEEPSEEK_PORT") or os.environ.get("GRADIO_SERVER_PORT") or 7860)
     
-    # Launch the interface
-    demo.launch(server_name="127.0.0.1", server_port=port, share=False)
-    
+    # Launch the interface (support multiple Gradio versions)
+    launch_kwargs = {"server_name": "127.0.0.1", "share": False}
+    launch_sig = inspect.signature(demo.launch)
+    if "port" in launch_sig.parameters:
+        launch_kwargs["port"] = port
+    elif "server_port" in launch_sig.parameters:
+        launch_kwargs["server_port"] = port
+    else:
+        log("Gradio launch() has no port argument; using default port", "WARNING")
+
+    try:
+        demo.launch(**launch_kwargs)
+    except OSError as e:
+        log(f"Launch failed on port {port}: {e}", "WARNING")
+        # Retry without forcing a port (let Gradio pick an open one)
+        os.environ.pop("GRADIO_SERVER_PORT", None)
+        os.environ.pop("DEEPSEEK_PORT", None)
+        fallback_kwargs = {"server_name": "127.0.0.1", "share": False}
+        fallback_sig = inspect.signature(demo.launch)
+        if "server_port" in fallback_sig.parameters:
+            fallback_kwargs["server_port"] = 0
+        demo.launch(**fallback_kwargs)
+
 if __name__ == "__main__":
     main()
-
-# End of file: deepseek_repl.py

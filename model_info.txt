@@ -1,8 +1,8 @@
 Model: deepseek-coder-6.7b-instruct
 Original repository: deepseek-ai/deepseek-coder-6.7b-instruct
-Installed on: Sun Mar 30 16:45:22 PDT 2025
-System: Linux xian-ThinkPad-T14-Gen-3 5.15.167.4-microsoft-standard-WSL2 #1 SMP Fri Jan 26 13:24:35 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux
-RAM: 15.5GB
-CPU: AMD Ryzen 7 PRO 6850U with Radeon Graphics
-GPU: NVIDIA GeForce RTX 3060
-Python: Python 3.12.2
+Installed on: Mon Feb  2 10:36:02 AEDT 2026
+System: Linux HomeDesk 5.15.167.4-microsoft-standard-WSL2 #1 SMP Tue Nov 5 00:21:55 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux
+RAM: 23.4GB
+CPU: AMD Ryzen 9 3900X 12-Core Processor
+GPU: NVIDIA GeForce RTX 2070
+Python: Python 3.12.3

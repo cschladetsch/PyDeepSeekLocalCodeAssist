@@ -2,8 +2,8 @@
 cd "$(dirname "$0")"
 source venv/bin/activate
 
-# Default settings
-PORT=7860
+# Default settings (allow env override)
+PORT="${DEEPSEEK_PORT:-7860}"
 MODEL_DIR=""
 
 # Parse command line options
@@ -37,6 +37,7 @@ done
 # Set environment variable to help with CUDA memory
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export DEEPSEEK_PORT=$PORT
+export GRADIO_SERVER_PORT=$PORT
 
 # Find the model directory if not specified
 if [ -z "$MODEL_DIR" ]; then

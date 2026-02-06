@@ -107,15 +107,19 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# Use the directory containing this script as the project root.
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
+
 # Handle cleanup mode
 if [ "$DO_CLEANUP" = true ]; then
-    if [ ! -d "$HOME/deepseek-local" ]; then
+    if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${RED}Installation directory not found. Nothing to clean up.${NC}"
         exit 1
     fi
     
     echo -e "${YELLOW}Cleaning up temporary files and fixing permissions...${NC}"
-    cd "$HOME/deepseek-local"
+    cd "$PROJECT_DIR"
     
     # Remove temporary files
     find . -name "*.pyc" -delete
@@ -132,12 +136,12 @@ fi
 
 # Handle uninstall mode
 if [ "$DO_UNINSTALL" = true ]; then
-    if [ ! -d "$HOME/deepseek-local" ]; then
+    if [ ! -d "$PROJECT_DIR" ]; then
         echo -e "${RED}Installation directory not found. Nothing to uninstall.${NC}"
         exit 1
     fi
     
-    echo -e "${YELLOW}Warning: This will remove the entire installation directory.${NC}"
+    echo -e "${YELLOW}Warning: This will remove the local venv and models directories.${NC}"
     read -p "Are you sure you want to proceed? (y/n) " -n 1 -r
     echo
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
@@ -145,9 +149,10 @@ if [ "$DO_UNINSTALL" = true ]; then
         exit 0
     fi
     
-    echo -e "${YELLOW}Removing installation directory...${NC}"
-    rm -rf "$HOME/deepseek-local"
-    echo -e "${GREEN}Uninstall complete!${NC}"
+    echo -e "${YELLOW}Removing venv and models...${NC}"
+    rm -rf "$PROJECT_DIR/venv"
+    rm -rf "$PROJECT_DIR/models"
+    echo -e "${GREEN}Uninstall complete! (repo left intact)${NC}"
     exit 0
 fi
 
@@ -245,7 +250,6 @@ else
 fi
 
 # Create project directory
-PROJECT_DIR="$HOME/deepseek-local"
 echo -e "${GREEN}Creating project directory at $PROJECT_DIR...${NC}"
 mkdir -p "$PROJECT_DIR"
 cd "$PROJECT_DIR"
