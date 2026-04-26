@@ -1,6 +1,6 @@
-Model: deepseek-coder-6.7b-instruct
-Original repository: deepseek-ai/deepseek-coder-6.7b-instruct
-Installed on: Mon Feb  2 10:36:02 AEDT 2026
+Model: deepseek-v2
+Original repository: deepseek-ai/deepseek-v2
+Installed on: Sun Apr 26 00:59:04 AEST 2026
 System: Linux HomeDesk 5.15.167.4-microsoft-standard-WSL2 #1 SMP Tue Nov 5 00:21:55 UTC 2024 x86_64 x86_64 x86_64 GNU/Linux
 RAM: 23.4GB
 CPU: AMD Ryzen 9 3900X 12-Core Processor

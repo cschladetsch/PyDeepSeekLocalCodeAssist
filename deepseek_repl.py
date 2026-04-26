@@ -6,7 +6,6 @@ import sys
 import platform
 import traceback
 from pathlib import Path
-import inspect
 
 # Get system info for display
 def get_system_info():
@@ -37,21 +36,27 @@ def load_model():
     model_name = os.environ.get('MODEL_NAME')
     
     if not model_name:
-        # Try to find a model directory
-        models_dir = Path("./models")
-        if models_dir.exists():
-            model_dirs = [d for d in models_dir.iterdir() if d.is_dir()]
-            if model_dirs:
-                model_name = model_dirs[0].name
-                log(f"Found model directory: {model_name}")
-            else:
-                log("No model directories found in ./models", "ERROR")
-                return None, None
-        else:
-            log("Models directory not found", "ERROR")
+        # Try to find a model in LLM_MODEL_HOME or local models/
+        model_home = os.environ.get('LLM_MODEL_HOME', os.path.expanduser('~/.models'))
+        for search_dir in [model_home, './models']:
+            p = Path(search_dir)
+            if p.exists():
+                model_dirs = [d for d in p.iterdir() if d.is_dir()]
+                if model_dirs:
+                    model_name = model_dirs[0].name
+                    log(f"Found model directory: {model_name} in {search_dir}")
+                    break
+        if not model_name:
+            log("No model directories found", "ERROR")
             return None, None
     
-    model_path = f"./models/{model_name}"
+    # Use MODEL_PATH if set, otherwise resolve from MODEL_HOME
+    model_path = os.environ.get('MODEL_PATH')
+    if not model_path:
+        model_home = os.environ.get('LLM_MODEL_HOME', os.path.expanduser('~/.models'))
+        model_path = os.path.join(model_home, model_name)
+        if not os.path.exists(model_path):
+            model_path = f"./models/{model_name}"  # local fallback
     log(f"Using model: {model_name} at {model_path}")
     
     try:
@@ -239,30 +244,10 @@ def main():
         clear.click(lambda: None, None, chatbot, queue=False)
     
     # Get port from environment variable or use default
-    port = int(os.environ.get("DEEPSEEK_PORT") or os.environ.get("GRADIO_SERVER_PORT") or 7860)
+    port = int(os.environ.get('DEEPSEEK_PORT', 7860))
     
-    # Launch the interface (support multiple Gradio versions)
-    launch_kwargs = {"server_name": "127.0.0.1", "share": False}
-    launch_sig = inspect.signature(demo.launch)
-    if "port" in launch_sig.parameters:
-        launch_kwargs["port"] = port
-    elif "server_port" in launch_sig.parameters:
-        launch_kwargs["server_port"] = port
-    else:
-        log("Gradio launch() has no port argument; using default port", "WARNING")
-
-    try:
-        demo.launch(**launch_kwargs)
-    except OSError as e:
-        log(f"Launch failed on port {port}: {e}", "WARNING")
-        # Retry without forcing a port (let Gradio pick an open one)
-        os.environ.pop("GRADIO_SERVER_PORT", None)
-        os.environ.pop("DEEPSEEK_PORT", None)
-        fallback_kwargs = {"server_name": "127.0.0.1", "share": False}
-        fallback_sig = inspect.signature(demo.launch)
-        if "server_port" in fallback_sig.parameters:
-            fallback_kwargs["server_port"] = 0
-        demo.launch(**fallback_kwargs)
+    # Launch the interface
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
 
 if __name__ == "__main__":
     main()

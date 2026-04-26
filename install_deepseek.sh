@@ -111,6 +111,9 @@ done
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$SCRIPT_DIR"
 
+# Canonical model store - shared across all repos
+MODEL_HOME="${LLM_MODEL_HOME:-$HOME/.models}"
+
 # Handle cleanup mode
 if [ "$DO_CLEANUP" = true ]; then
     if [ ! -d "$PROJECT_DIR" ]; then
@@ -149,9 +152,10 @@ if [ "$DO_UNINSTALL" = true ]; then
         exit 0
     fi
     
-    echo -e "${YELLOW}Removing venv and models...${NC}"
+    echo -e "${YELLOW}Removing venv...${NC}"
     rm -rf "$PROJECT_DIR/venv"
-    rm -rf "$PROJECT_DIR/models"
+    echo -e "${YELLOW}Note: models in $MODEL_HOME are shared and NOT removed.${NC}"
+    echo -e "${YELLOW}To remove them manually: rm -rf $MODEL_HOME${NC}"
     echo -e "${GREEN}Uninstall complete! (repo left intact)${NC}"
     exit 0
 fi
@@ -307,10 +311,10 @@ if [ "$GPU_AVAILABLE" = true ]; then
     pip install bitsandbytes
 fi
 
-# Create models directory
-echo -e "${GREEN}Creating models directory...${NC}"
-mkdir -p models
-cd models
+# Create canonical model store
+echo -e "${GREEN}Using model store: $MODEL_HOME${NC}"
+mkdir -p "$MODEL_HOME"
+cd "$MODEL_HOME"
 
 # Define model list based on specified options
 if [ -n "$SPECIFIED_MODEL" ]; then
@@ -350,10 +354,10 @@ fi
 MODEL_DOWNLOADED=false
 
 # First, check if any of the models are already downloaded
-if [ -d "$PROJECT_DIR/models" ]; then
+if [ -d "$MODEL_HOME" ]; then
     for MODEL in "${MODELS[@]}"; do
         MODEL_NAME=$(echo "$MODEL" | cut -d'/' -f2)
-        if [ -d "$PROJECT_DIR/models/$MODEL_NAME" ]; then
+        if [ -d "$MODEL_HOME/$MODEL_NAME" ]; then
             echo -e "${GREEN}Found already downloaded model: $MODEL_NAME${NC}"
             
             if [ -n "$SPECIFIED_MODEL" ] && [ "$SPECIFIED_MODEL" != "$MODEL" ]; then
@@ -499,21 +503,27 @@ def load_model():
     model_name = os.environ.get('MODEL_NAME')
     
     if not model_name:
-        # Try to find a model directory
-        models_dir = Path("./models")
-        if models_dir.exists():
-            model_dirs = [d for d in models_dir.iterdir() if d.is_dir()]
-            if model_dirs:
-                model_name = model_dirs[0].name
-                log(f"Found model directory: {model_name}")
-            else:
-                log("No model directories found in ./models", "ERROR")
-                return None, None
-        else:
-            log("Models directory not found", "ERROR")
+        # Try to find a model in LLM_MODEL_HOME or local models/
+        model_home = os.environ.get('LLM_MODEL_HOME', os.path.expanduser('~/.models'))
+        for search_dir in [model_home, './models']:
+            p = Path(search_dir)
+            if p.exists():
+                model_dirs = [d for d in p.iterdir() if d.is_dir()]
+                if model_dirs:
+                    model_name = model_dirs[0].name
+                    log(f"Found model directory: {model_name} in {search_dir}")
+                    break
+        if not model_name:
+            log("No model directories found", "ERROR")
             return None, None
     
-    model_path = f"./models/{model_name}"
+    # Use MODEL_PATH if set, otherwise resolve from MODEL_HOME
+    model_path = os.environ.get('MODEL_PATH')
+    if not model_path:
+        model_home = os.environ.get('LLM_MODEL_HOME', os.path.expanduser('~/.models'))
+        model_path = os.path.join(model_home, model_name)
+        if not os.path.exists(model_path):
+            model_path = f"./models/{model_name}"  # local fallback
     log(f"Using model: {model_name} at {model_path}")
     
     try:
@@ -717,6 +727,9 @@ cat > start_deepseek.sh << EOL
 cd "\$(dirname "\$0")"
 source venv/bin/activate
 
+# Canonical model store
+MODEL_HOME="\${LLM_MODEL_HOME:-\$HOME/.models}"
+
 # Default settings
 PORT=7860
 MODEL_DIR=""
@@ -726,13 +739,11 @@ while [[ \$# -gt 0 ]]; do
     case \$1 in
         -p|--port)
             PORT="\$2"
-            shift
-            shift
+            shift 2
             ;;
         -m|--model)
             MODEL_DIR="\$2"
-            shift
-            shift
+            shift 2
             ;;
         -h|--help)
             echo "Usage: \$0 [options]"
@@ -740,6 +751,8 @@ while [[ \$# -gt 0 ]]; do
             echo "  -p, --port PORT    Specify port (default: 7860)"
             echo "  -m, --model DIR    Specify model directory name (default: auto-detect)"
             echo "  -h, --help         Show this help"
+            echo ""
+            echo "Model store: \${MODEL_HOME} (override with LLM_MODEL_HOME)"
             exit 0
             ;;
         *)
@@ -749,27 +762,41 @@ while [[ \$# -gt 0 ]]; do
     esac
 done
 
-# Set environment variable to help with CUDA memory
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export DEEPSEEK_PORT=\$PORT
+export GRADIO_SERVER_PORT=\$PORT
 
-# Find the model directory if not specified
 if [ -z "\$MODEL_DIR" ]; then
-    export MODEL_NAME=\$(ls models | head -1)
-else
-    if [ -d "models/\$MODEL_DIR" ]; then
-        export MODEL_NAME="\$MODEL_DIR"
+    if [ -d "\$MODEL_HOME" ] && [ -n "\$(ls -A "\$MODEL_HOME" 2>/dev/null)" ]; then
+        export MODEL_NAME=\$(ls "\$MODEL_HOME" | head -1)
+        export MODEL_PATH="\$MODEL_HOME/\$MODEL_NAME"
+    elif [ -d "models" ] && [ -n "\$(ls -A models 2>/dev/null)" ]; then
+        echo "Warning: using local models/ dir. Set LLM_MODEL_HOME to use ~/.models"
+        export MODEL_NAME=\$(ls models | head -1)
+        export MODEL_PATH="\$(pwd)/models/\$MODEL_NAME"
     else
-        echo "Error: Model directory 'models/\$MODEL_DIR' not found"
-        echo "Available models:"
-        ls -1 models/
+        echo "Error: No models found in \$MODEL_HOME or local models/"
+        exit 1
+    fi
+else
+    if [ -d "\$MODEL_HOME/\$MODEL_DIR" ]; then
+        export MODEL_NAME="\$MODEL_DIR"
+        export MODEL_PATH="\$MODEL_HOME/\$MODEL_DIR"
+    elif [ -d "models/\$MODEL_DIR" ]; then
+        echo "Warning: found model in local models/ not in \$MODEL_HOME"
+        export MODEL_NAME="\$MODEL_DIR"
+        export MODEL_PATH="\$(pwd)/models/\$MODEL_DIR"
+    else
+        echo "Error: Model '\$MODEL_DIR' not found in \$MODEL_HOME or local models/"
+        ls -1 "\$MODEL_HOME" 2>/dev/null || true
+        ls -1 models/ 2>/dev/null || true
         exit 1
     fi
 fi
 
 echo "Starting with model: \$MODEL_NAME on port \$PORT"
+echo "Model path: \$MODEL_PATH"
 
-# Launch the interface
 python deepseek_repl.py
 EOL
 
@@ -779,28 +806,28 @@ cat > start_deepseek_network.sh << EOL
 cd "\$(dirname "\$0")"
 source venv/bin/activate
 
+# Canonical model store
+MODEL_HOME="\${LLM_MODEL_HOME:-\$HOME/.models}"
+
 # Default settings
 PORT=7860
 MODEL_DIR=""
-IP="0.0.0.0"
+IP="127.0.0.1"
 
 # Parse command line options
 while [[ \$# -gt 0 ]]; do
     case \$1 in
         -p|--port)
             PORT="\$2"
-            shift
-            shift
+            shift 2
             ;;
         -m|--model)
             MODEL_DIR="\$2"
-            shift
-            shift
+            shift 2
             ;;
         -i|--ip)
             IP="\$2"
-            shift
-            shift
+            shift 2
             ;;
         -h|--help)
             echo "Usage: \$0 [options]"
@@ -818,36 +845,39 @@ while [[ \$# -gt 0 ]]; do
     esac
 done
 
-# Set environment variable to help with CUDA memory
 export PYTORCH_CUDA_ALLOC_CONF=max_split_size_mb:512
 export DEEPSEEK_PORT=\$PORT
 
-# Find the model directory if not specified
 if [ -z "\$MODEL_DIR" ]; then
-    export MODEL_NAME=\$(ls models | head -1)
-else
-    if [ -d "models/\$MODEL_DIR" ]; then
-        export MODEL_NAME="\$MODEL_DIR"
+    if [ -d "\$MODEL_HOME" ] && [ -n "\$(ls -A "\$MODEL_HOME" 2>/dev/null)" ]; then
+        export MODEL_NAME=\$(ls "\$MODEL_HOME" | head -1)
+        export MODEL_PATH="\$MODEL_HOME/\$MODEL_NAME"
+    elif [ -d "models" ] && [ -n "\$(ls -A models 2>/dev/null)" ]; then
+        export MODEL_NAME=\$(ls models | head -1)
+        export MODEL_PATH="\$(pwd)/models/\$MODEL_NAME"
     else
-        echo "Error: Model directory 'models/\$MODEL_DIR' not found"
-        echo "Available models:"
-        ls -1 models/
+        echo "Error: No models found in \$MODEL_HOME or local models/"
+        exit 1
+    fi
+else
+    if [ -d "\$MODEL_HOME/\$MODEL_DIR" ]; then
+        export MODEL_NAME="\$MODEL_DIR"
+        export MODEL_PATH="\$MODEL_HOME/\$MODEL_DIR"
+    elif [ -d "models/\$MODEL_DIR" ]; then
+        export MODEL_NAME="\$MODEL_DIR"
+        export MODEL_PATH="\$(pwd)/models/\$MODEL_DIR"
+    else
+        echo "Error: Model '\$MODEL_DIR' not found"
         exit 1
     fi
 fi
 
 echo "Starting with model: \$MODEL_NAME on \$IP:\$PORT (network accessible)"
+echo "Model path: \$MODEL_PATH"
 
-# Create a temporary modified copy of the script
 cp deepseek_repl.py deepseek_repl_network.py
-
-# Modify the launch line in the script to allow network access
 sed -i "s/server_name=\"127.0.0.1\", port=port, share=False/server_name=\"\$IP\", port=port, share=False/g" deepseek_repl_network.py
-
-# Launch the interface
 python deepseek_repl_network.py
-
-# Clean up
 rm deepseek_repl_network.py
 EOL
 
