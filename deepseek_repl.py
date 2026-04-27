@@ -1,6 +1,7 @@
 import gradio as gr
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM
+from transformers import AutoTokenizer, AutoModelForCausalLM, TextIteratorStreamer
+import threading
 import os
 import sys
 import platform
@@ -78,7 +79,7 @@ def load_model():
             log("Loading model with GPU acceleration (float16)...")
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 device_map="auto",
                 trust_remote_code=True,
                 low_cpu_mem_usage=True,
@@ -110,154 +111,178 @@ def get_max_length(tokenizer):
         return min(tokenizer.model_max_length, 2048)
     return 1024
 
-# Process file content
+# Process file content — accepts string paths (multimodal) or legacy file objects
 def process_files(files):
     file_context = ""
+    if not files:
+        return file_context
+
+    image_exts = {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
 
     for file in files:
         try:
-            file_path = file.path if hasattr(file, "path") else file.name
-            file_name = file.orig_name if hasattr(file, "orig_name") and file.orig_name else os.path.basename(file_path)
+            if isinstance(file, str):
+                file_path = file
+                file_name = os.path.basename(file_path)
+            elif isinstance(file, dict):
+                file_path = file.get("path", "")
+                file_name = file.get("orig_name", os.path.basename(file_path))
+            else:
+                file_path = getattr(file, "path", None) or getattr(file, "name", "")
+                file_name = getattr(file, "orig_name", None) or os.path.basename(file_path)
+
+            if not file_path or not os.path.exists(file_path):
+                continue
+
             file_size = os.path.getsize(file_path)
+            ext = os.path.splitext(file_name)[1].lower()
 
             try:
                 with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
-                    file_context += f"\nFile: {file_name}\nSize: {file_size} bytes\nContent:\n{content}\n\n"
+                file_context += f"\nFile: {file_name} ({file_size} bytes)\n{content}\n"
             except UnicodeDecodeError:
-                file_context += f"\nBinary File: {file_name}\nSize: {file_size} bytes\n"
-                if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.pdf')):
-                    file_context += f"File type: {file_name.split('.')[-1]}\n"
+                kind = "image" if ext in image_exts else "binary"
+                file_context += f"\n[{kind} file: {file_name}, {file_size} bytes]\n"
 
         except Exception as e:
-            file_context += f"\nError reading file {file_name}: {str(e)}\n"
+            file_context += f"\n[error reading file: {e}]\n"
 
     return file_context
 
-# Function to process user queries
-def process_query(message, history, files, model, tokenizer):
-    if not message:
-        return history
-    
-    if model is None or tokenizer is None:
-        history.append({"role": "assistant", "content": "Error: Model failed to load. Please check the logs and restart the application."})
-        return history
-    
-    # Process file content if files are uploaded
-    file_context = process_files(files) if files else ""
-    
-    # Combine file context with user message
-    if file_context:
-        input_text = f"I've uploaded the following files (processed locally):\n{file_context}\n\nMy question is: {message}"
+# Generator that yields response text chunks — used by gr.ChatInterface (multimodal=True)
+def chat_fn(message, history):
+    # multimodal=True: message is {"text": "...", "files": ["path", ...]}
+    if isinstance(message, dict):
+        text = (message.get("text") or "").strip()
+        files = message.get("files") or []
     else:
-        input_text = message
-    
-    # Add user message to history
-    history.append({"role": "user", "content": message})
-    
-    # Generate response
+        text = str(message).strip()
+        files = []
+
+    if not text and not files:
+        return
+
+    file_context = process_files(files)
+    if file_context and text:
+        input_text = f"Files:\n{file_context}\nQuestion: {text}"
+    elif file_context:
+        input_text = file_context.strip()
+    else:
+        input_text = text
+
     try:
-        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
-        input_ids = inputs["input_ids"]
-        attention_mask = inputs["attention_mask"]
+        tokenizer = chat_fn._tokenizer
+        model = chat_fn._model
+
+        # Build message list for chat template, including prior turns
+        messages = []
+        for msg in (history or []):
+            role = msg.get("role", "") if isinstance(msg, dict) else ""
+            content = msg.get("content", "") if isinstance(msg, dict) else str(msg)
+            if isinstance(content, list):
+                content = " ".join(
+                    c.get("text", "") if isinstance(c, dict) else str(c) for c in content
+                )
+            if role in ("user", "assistant") and str(content).strip():
+                messages.append({"role": role, "content": str(content).strip()})
+        messages.append({"role": "user", "content": input_text})
+
+        # Apply the model's instruct chat template so generation is non-empty
+        try:
+            prompt = tokenizer.apply_chat_template(
+                messages, tokenize=False, add_generation_prompt=True
+            )
+        except Exception:
+            prompt = input_text
+
+        inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
+
+        streamer = TextIteratorStreamer(
+            tokenizer, skip_prompt=True, skip_special_tokens=True, timeout=60.0
+        )
+
+        def generate():
+            with torch.no_grad():
+                model.generate(
+                    inputs["input_ids"],
+                    attention_mask=inputs["attention_mask"],
+                    max_new_tokens=512,
+                    temperature=0.7,
+                    top_p=0.9,
+                    top_k=40,
+                    do_sample=True,
+                    pad_token_id=tokenizer.eos_token_id,
+                    repetition_penalty=1.1,
+                    streamer=streamer,
+                )
 
         log_vram("before generate")
-        with torch.no_grad():
-            output = model.generate(
-                input_ids,
-                attention_mask=attention_mask,
-                max_new_tokens=512,
-                temperature=0.7,
-                top_p=0.9,
-                top_k=40,
-                do_sample=True,
-                pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.1,
-            )
+        thread = threading.Thread(target=generate)
+        thread.start()
+
+        partial = ""
+        for token in streamer:
+            partial += token
+            yield partial
+
+        thread.join()
         log_vram("after generate")
-        
-        response = tokenizer.decode(output[0], skip_special_tokens=True)
-        
-        # Extract only the response part (not the input)
-        if response.startswith(input_text):
-            response = response[len(input_text):].strip()
-        
-        # If response is empty or just whitespace, provide a fallback
-        if not response or response.isspace():
-            response = "I couldn't generate a meaningful response. Please try rephrasing your question."
-        
-        history.append({"role": "assistant", "content": response})
-        return history
-    
+
+        # Release GPU memory held by this request
+        del inputs
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if not partial.strip():
+            yield "I couldn't generate a response. The model may not understand this type of query."
+
     except Exception as e:
-        history.append({"role": "assistant", "content": f"An error occurred while generating a response: {str(e)}"})
-        return history
+        log(f"Generation error: {e}", "ERROR")
+        yield f"Error: {str(e)}"
+
 
 # Main function
 def main():
-    # Load model and tokenizer
     model, tokenizer = load_model()
-    
+
     if model is None or tokenizer is None:
         print("Failed to load model. Exiting.")
         sys.exit(1)
-    
-    # Get system info
+
+    chat_fn._model = model
+    chat_fn._tokenizer = tokenizer
+
     system_info = get_system_info()
     info_text = "\n".join([f"**{k}**: {v}" for k, v in system_info.items()])
-    
-    # Create Gradio interface
-    with gr.Blocks() as demo:
-        gr.Markdown(f"# DeepSeek Local Interface - {os.environ.get('MODEL_NAME', 'Unknown Model')}")
-        gr.Markdown("All processing occurs locally on your machine. Uploaded files are never sent over the internet.")
-        
+
+    interface = gr.ChatInterface(
+        fn=chat_fn,
+        multimodal=True,
+        title=f"DeepSeek Local — {os.environ.get('MODEL_NAME', 'Unknown Model')}",
+        description="All processing occurs locally. Files and queries never leave your machine.",
+        chatbot=gr.Chatbot(show_label=False),
+        textbox=gr.MultimodalTextbox(
+            placeholder="Message... (Enter to send, Shift+Enter for new line)",
+            file_types=["image", "text", ".pdf", ".md", ".csv"],
+            show_label=False,
+        ),
+        fill_height=True,
+    )
+
+    with interface:
         with gr.Accordion("System Information", open=False):
             gr.Markdown(info_text)
             gr.Markdown(f"**Model**: {os.environ.get('MODEL_NAME', 'Unknown')}")
-            gr.Markdown("**Privacy Notice**: All processing occurs locally. Files and queries never leave your machine.")
-        
-        with gr.Row():
-            with gr.Column(scale=1):
-                files = gr.File(file_count="multiple", label="Upload Files (Processed Locally)")
-                gr.Markdown("Files are processed entirely on your local machine.")
-            
-        chatbot = gr.Chatbot(height=500)
-        msg = gr.Textbox(label="Enter your query", placeholder="Type your question here...", lines=3)
-        
-        with gr.Row():
-            submit_btn = gr.Button("Submit", variant="primary")
-            clear = gr.Button("Clear Chat")
-        
-        def submit_query(message, history, files):
-            return process_query(message, history, files, model, tokenizer)
 
-        # Handle query submission
-        msg.submit(
-            fn=submit_query,
-            inputs=[msg, chatbot, files],
-            outputs=[chatbot]
-        ).then(
-            fn=lambda: "",
-            outputs=[msg]
-        )
-
-        submit_btn.click(
-            fn=submit_query,
-            inputs=[msg, chatbot, files],
-            outputs=[chatbot]
-        ).then(
-            fn=lambda: "",
-            outputs=[msg]
-        )
-        
-        # Clear chat history
-        clear.click(lambda: [], None, chatbot, queue=False)
-    
-    # Get port from environment variable or use default
     port = int(os.environ.get('DEEPSEEK_PORT', 7860))
-    
-    # Launch the interface
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False, theme=gr.themes.Soft())
+    interface.launch(
+        server_name="0.0.0.0",
+        server_port=port,
+        share=False,
+        theme=gr.themes.Soft(),
+        js="() => { const app = document.querySelector('gradio-app'); if (app) app.theme_mode = 'dark'; }",
+    )
 
 if __name__ == "__main__":
     main()
