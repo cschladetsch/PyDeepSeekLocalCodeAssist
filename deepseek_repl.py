@@ -1,6 +1,6 @@
 import gradio as gr
 import torch
-from transformers import AutoTokenizer, AutoModelForCausalLM, BitsAndBytesConfig
+from transformers import AutoTokenizer, AutoModelForCausalLM
 import os
 import sys
 import platform
@@ -27,6 +27,15 @@ def get_system_info():
 # Setup logging
 def log(message, level="INFO"):
     print(f"[{level}] {message}")
+
+def log_vram(label=""):
+    if not torch.cuda.is_available():
+        return
+    allocated = torch.cuda.memory_allocated() / 1024**3
+    reserved  = torch.cuda.memory_reserved()  / 1024**3
+    total     = torch.cuda.get_device_properties(0).total_memory / 1024**3
+    tag = f" [{label}]" if label else ""
+    log(f"VRAM{tag}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved, {total:.2f} GB total")
 
 # Configure and load model
 def load_model():
@@ -66,47 +75,26 @@ def load_model():
         
         # Configure model loading based on available hardware
         if torch.cuda.is_available():
-            log("Loading model with GPU acceleration...")
-            
-            # For 32GB RAM system, we can use 8-bit quantization for better quality
-            # while still allowing for larger models
-            try:
-                # First try 8-bit quantization (better quality than 4-bit)
-                quantization_config = BitsAndBytesConfig(
-                    load_in_8bit=True,
-                    llm_int8_has_fp16_weight=True
-                )
-                
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    quantization_config=quantization_config,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    max_memory={0: "24GiB", "cpu": "8GiB"}  # Optimize for 32GB system
-                )
-                log("Model loaded with 8-bit quantization (optimized for 32GB RAM)")
-            except Exception as e:
-                log(f"8-bit quantization failed: {str(e)}", "WARNING")
-                log("Falling back to 16-bit precision...")
-                
-                model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    torch_dtype=torch.float16,
-                    device_map="auto",
-                    trust_remote_code=True,
-                    low_cpu_mem_usage=True,
-                    max_memory={0: "24GiB", "cpu": "8GiB"}  # Optimize for 32GB system
-                )
-                log("Model loaded with 16-bit precision (optimized for 32GB RAM)")
+            log("Loading model with GPU acceleration (float16)...")
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                torch_dtype=torch.float16,
+                device_map="auto",
+                trust_remote_code=True,
+                low_cpu_mem_usage=True,
+            )
+            model.eval()
+            log("Model loaded with float16 precision")
+            log_vram("after load")
         else:
             log("Loading model on CPU (will be slow)...")
             model = AutoModelForCausalLM.from_pretrained(
                 model_path,
                 device_map="auto",
                 trust_remote_code=True,
-                low_cpu_mem_usage=True
+                low_cpu_mem_usage=True,
             )
+            model.eval()
             log("Model loaded on CPU")
         
         return model, tokenizer
@@ -125,34 +113,35 @@ def get_max_length(tokenizer):
 # Process file content
 def process_files(files):
     file_context = ""
-    
+
     for file in files:
         try:
-            file_name = os.path.basename(file.name)
-            file_size = os.path.getsize(file.name)
-            
-            # First try to read as text
+            file_path = file.path if hasattr(file, "path") else file.name
+            file_name = file.orig_name if hasattr(file, "orig_name") and file.orig_name else os.path.basename(file_path)
+            file_size = os.path.getsize(file_path)
+
             try:
-                with open(file.name, "r", encoding="utf-8") as f:
+                with open(file_path, "r", encoding="utf-8") as f:
                     content = f.read()
                     file_context += f"\nFile: {file_name}\nSize: {file_size} bytes\nContent:\n{content}\n\n"
             except UnicodeDecodeError:
-                # Try to handle binary files
                 file_context += f"\nBinary File: {file_name}\nSize: {file_size} bytes\n"
-                
-                # Check if it's a common binary type we can read
                 if file_name.endswith(('.png', '.jpg', '.jpeg', '.gif', '.pdf')):
                     file_context += f"File type: {file_name.split('.')[-1]}\n"
-                    
+
         except Exception as e:
             file_context += f"\nError reading file {file_name}: {str(e)}\n"
-    
+
     return file_context
 
 # Function to process user queries
 def process_query(message, history, files, model, tokenizer):
+    if not message:
+        return history
+    
     if model is None or tokenizer is None:
-        return "Error: Model failed to load. Please check the logs and restart the application."
+        history.append({"role": "assistant", "content": "Error: Model failed to load. Please check the logs and restart the application."})
+        return history
     
     # Process file content if files are uploaded
     file_context = process_files(files) if files else ""
@@ -163,23 +152,29 @@ def process_query(message, history, files, model, tokenizer):
     else:
         input_text = message
     
+    # Add user message to history
+    history.append({"role": "user", "content": message})
+    
     # Generate response
     try:
-        input_ids = tokenizer.encode(input_text, return_tensors="pt").to(model.device)
-        max_length = min(input_ids.shape[1] + 1024, get_max_length(tokenizer))
-        
+        inputs = tokenizer(input_text, return_tensors="pt").to(model.device)
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs["attention_mask"]
+
+        log_vram("before generate")
         with torch.no_grad():
             output = model.generate(
                 input_ids,
-                max_length=max_length,
+                attention_mask=attention_mask,
+                max_new_tokens=512,
                 temperature=0.7,
                 top_p=0.9,
                 top_k=40,
                 do_sample=True,
-                num_beams=1,  # Disable beam search for faster generation
                 pad_token_id=tokenizer.eos_token_id,
-                repetition_penalty=1.1  # Slightly penalize repetition
+                repetition_penalty=1.1,
             )
+        log_vram("after generate")
         
         response = tokenizer.decode(output[0], skip_special_tokens=True)
         
@@ -191,10 +186,12 @@ def process_query(message, history, files, model, tokenizer):
         if not response or response.isspace():
             response = "I couldn't generate a meaningful response. Please try rephrasing your question."
         
-        return response
+        history.append({"role": "assistant", "content": response})
+        return history
     
     except Exception as e:
-        return f"An error occurred while generating a response: {str(e)}"
+        history.append({"role": "assistant", "content": f"An error occurred while generating a response: {str(e)}"})
+        return history
 
 # Main function
 def main():
@@ -205,23 +202,18 @@ def main():
         print("Failed to load model. Exiting.")
         sys.exit(1)
     
-    # Create a simple cache mechanism for large texts
-    input_cache = {}
-    response_cache = {}
-    
     # Get system info
     system_info = get_system_info()
     info_text = "\n".join([f"**{k}**: {v}" for k, v in system_info.items()])
     
     # Create Gradio interface
-    with gr.Blocks(theme=gr.themes.Soft()) as demo:
+    with gr.Blocks() as demo:
         gr.Markdown(f"# DeepSeek Local Interface - {os.environ.get('MODEL_NAME', 'Unknown Model')}")
         gr.Markdown("All processing occurs locally on your machine. Uploaded files are never sent over the internet.")
         
         with gr.Accordion("System Information", open=False):
             gr.Markdown(info_text)
-            gr.Markdown(f"**Model**: {os
-.environ.get('MODEL_NAME', 'Unknown')}")
+            gr.Markdown(f"**Model**: {os.environ.get('MODEL_NAME', 'Unknown')}")
             gr.Markdown("**Privacy Notice**: All processing occurs locally. Files and queries never leave your machine.")
         
         with gr.Row():
@@ -231,23 +223,41 @@ def main():
             
         chatbot = gr.Chatbot(height=500)
         msg = gr.Textbox(label="Enter your query", placeholder="Type your question here...", lines=3)
-        clear = gr.Button("Clear Chat")
         
+        with gr.Row():
+            submit_btn = gr.Button("Submit", variant="primary")
+            clear = gr.Button("Clear Chat")
+        
+        def submit_query(message, history, files):
+            return process_query(message, history, files, model, tokenizer)
+
         # Handle query submission
         msg.submit(
-            fn=lambda message, history, files: process_query(message, history, files, model, tokenizer),
+            fn=submit_query,
             inputs=[msg, chatbot, files],
-            outputs=chatbot
+            outputs=[chatbot]
+        ).then(
+            fn=lambda: "",
+            outputs=[msg]
+        )
+
+        submit_btn.click(
+            fn=submit_query,
+            inputs=[msg, chatbot, files],
+            outputs=[chatbot]
+        ).then(
+            fn=lambda: "",
+            outputs=[msg]
         )
         
         # Clear chat history
-        clear.click(lambda: None, None, chatbot, queue=False)
+        clear.click(lambda: [], None, chatbot, queue=False)
     
     # Get port from environment variable or use default
     port = int(os.environ.get('DEEPSEEK_PORT', 7860))
     
     # Launch the interface
-    demo.launch(server_name="0.0.0.0", server_port=port, share=False)
+    demo.launch(server_name="0.0.0.0", server_port=port, share=False, theme=gr.themes.Soft())
 
 if __name__ == "__main__":
     main()

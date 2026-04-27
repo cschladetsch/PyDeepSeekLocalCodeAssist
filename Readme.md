@@ -15,6 +15,8 @@ A local, private interface for running DeepSeek language models on your own mach
 
 ## Installation
 
+Suggestion: use `pip freeze` to ensure the floor doesn't become lava later.
+
 ### Option 1: Using the Installation Script (Recommended)
 
 1. Clone this repository:
